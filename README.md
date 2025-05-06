@@ -17,15 +17,9 @@ To run this project locally, follow the steps below.
 ```bash
 python --version
 ```
+* Link to python https://www.python.org/downloads/
 
 ### 2. Create and Activate a Virtual Environment
-
-**On macOS/Linux:**
-
-```bash
-python -m venv venv
-source venv/bin/activate
-```
 
 **On Windows:**
 
@@ -34,11 +28,26 @@ python -m venv venv
 venv\Scripts\activate
 ```
 
+**On macOS/Linux:**
+
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
 *Optional: Use the provided script to automate this step.*
 
 ### 3. (Optional) Use the Provided Bash Script
 
-You can use `start_env.sh` to automatically set up and activate the virtual environment:
+You can use `start_env.bat` to automatically set up and activate the virtual environment:
+
+**On Windows:**
+
+```bash
+bash start_env.bat
+```
+
+**On macOS/Linux:**
 
 ```bash
 bash start_env.sh
@@ -52,7 +61,7 @@ bash start_env.sh
 
 ### 4. Install Required Packages
 
-Once the virtual environment is active, install the necessary dependencies with:
+Once the virtual environment is active, install the necessary dependencies with (This takes a while):
 
 ```bash
 pip install -r requirements.txt
