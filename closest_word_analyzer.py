@@ -16,17 +16,64 @@ DEFAULT_MODEL_NAME = "mistralai/Mistral-7B-v0.3"
 
 def get_closest_words(vector, embedding_layer, tokenizer, top_n=10, epsilon=1e-8):
     """Find closest words to a given vector using cosine similarity"""
-    # Normalize the input vector and embeddings
-    vector = F.normalize(vector.unsqueeze(0), p=2, dim=1, eps=epsilon)
-    embeddings = F.normalize(embedding_layer.weight, p=2, dim=1, eps=epsilon)
+    # Check for NaN or Inf values
+    if torch.isnan(vector).any() or torch.isinf(vector).any():
+        print("Warning: Input vector contains NaN or Inf values. Fixing...")
+        vector = torch.nan_to_num(vector, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # Normalize the input vector 
+    vector_norm = torch.norm(vector, p=2)
+    if vector_norm > 0:
+        vector = vector / vector_norm
+    else:
+        print("Warning: Zero vector detected")
+        return [("ERROR_ZERO_VECTOR", 0.0)] * top_n
+    
+    # Normalize embeddings (row-wise)
+    norms = torch.norm(embedding_layer.weight, p=2, dim=1, keepdim=True)
+    valid_indices = norms.squeeze() > 0  # Filter out zero vectors
+    normalized_embeddings = torch.zeros_like(embedding_layer.weight)
+    normalized_embeddings[valid_indices] = embedding_layer.weight[valid_indices] / norms[valid_indices]
     
     # Compute cosine similarity
-    similarity = torch.matmul(vector, embeddings.T).squeeze(0)
+    similarity = torch.matmul(vector.unsqueeze(0), normalized_embeddings.T).squeeze(0)
     
-    # Get the top N most similar words
-    top_values, top_indices = torch.topk(similarity, top_n)
-    top_words = [tokenizer.decode([idx.item()]).strip() for idx in top_indices]
-    top_scores = [similarity[idx].item() for idx in top_indices]
+    # Replace NaN values with very low similarity score
+    similarity = torch.nan_to_num(similarity, nan=-1.0)
+    
+    # Filter out special tokens and control tokens
+    valid_tokens = []
+    for i in range(len(similarity)):
+        token = tokenizer.decode([i]).strip()
+        if not (token.startswith('[control_') or token in ['<unk>', '<s>', '</s>', '<pad>']):
+            valid_tokens.append(i)
+    
+    # Get the top N most similar words from valid tokens
+    valid_similarity = similarity[valid_tokens]
+    if len(valid_similarity) >= top_n:
+        top_values, relative_indices = torch.topk(valid_similarity, top_n)
+        top_indices = [valid_tokens[idx] for idx in relative_indices]
+    else:
+        print(f"Warning: Only {len(valid_similarity)} valid tokens found, less than requested top_n={top_n}")
+        top_values, relative_indices = torch.topk(valid_similarity, len(valid_similarity))
+        top_indices = [valid_tokens[idx] for idx in relative_indices]
+        # Pad with dummy entries
+        while len(top_indices) < top_n:
+            top_indices.append(-1)
+            top_values = torch.cat([top_values, torch.tensor([-1.0], device=top_values.device)])
+    
+    # Decode and format results
+    top_words = []
+    top_scores = []
+    for idx, val in zip(top_indices, top_values):
+        if idx == -1:
+            word = "N/A"
+            score = -1.0
+        else:
+            word = tokenizer.decode([idx]).strip()
+            score = val.item()
+        top_words.append(word)
+        top_scores.append(score)
     
     return list(zip(top_words, top_scores))
 
@@ -48,36 +95,79 @@ def parse_args():
 
 def get_word_vector(word, tokenizer, embedding_layer):
     """Get embedding vector for a word, handling multi-token words"""
-    word_ids = tokenizer.encode(word, add_special_tokens=False)
+    # Add space before if it's not a special token to improve tokenization
+    if not word.startswith('[') and not word.startswith('<'):
+        word_to_tokenize = ' ' + word
+    else:
+        word_to_tokenize = word
+        
+    word_ids = tokenizer.encode(word_to_tokenize, add_special_tokens=False)
     
     if not word_ids:
         print(f"Warning: '{word}' not found in vocabulary")
         return None
     
     # For multi-token words, average the embeddings
+    tokens = tokenizer.convert_ids_to_tokens(word_ids)
     if len(word_ids) > 1:
-        print(f"Note: '{word}' is tokenized into {len(word_ids)} tokens: {tokenizer.convert_ids_to_tokens(word_ids)}")
-        vectors = [embedding_layer(torch.tensor([token_id])) for token_id in word_ids]
-        return torch.mean(torch.stack(vectors), dim=0)
+        print(f"Note: '{word}' is tokenized into {len(word_ids)} tokens: {tokens}")
+        vectors = []
+        for token_id in word_ids:
+            # Check if token is valid (not a special token)
+            token = tokenizer.decode([token_id]).strip()
+            if token and not (token.startswith('[control_') or token in ['<unk>', '<s>', '</s>', '<pad>']):
+                vectors.append(embedding_layer(torch.tensor([token_id])))
+        
+        if not vectors:
+            print(f"Error: No valid tokens found for '{word}'")
+            return None
+            
+        vector = torch.mean(torch.stack(vectors), dim=0)
     else:
-        return embedding_layer(torch.tensor([word_ids[0]]))
+        # Check if the single token is valid
+        token = tokenizer.decode([word_ids[0]]).strip()
+        if token.startswith('[control_') or token in ['<unk>', '<s>', '</s>', '<pad>']:
+            print(f"Warning: '{word}' maps to special token {token}, which may cause issues")
+            
+        vector = embedding_layer(torch.tensor([word_ids[0]]))
+        
+    # Check for NaN values
+    if torch.isnan(vector).any():
+        print(f"Warning: Vector for '{word}' contains NaN values. Replacing with zeros.")
+        vector = torch.nan_to_num(vector, nan=0.0)
+        
+    return vector
 
 def analyze_word_combination(words, semantic_set, model_name, trials=100, noise_level=0.01, top_n=20):
     """Analyze a combination of words in the embedding space"""
     print(f"Loading model: {model_name}")
     
     # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        use_auth_token=HUGGINGFACE_TOKEN,
-        padding_side="right"
-    )
-    model = AutoModel.from_pretrained(
-        model_name,
-        use_auth_token=HUGGINGFACE_TOKEN,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.float16,
-    )
+    try:
+        # First try with auth token
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_auth_token=HUGGINGFACE_TOKEN,
+            padding_side="right"
+        )
+        model = AutoModel.from_pretrained(
+            model_name,
+            use_auth_token=HUGGINGFACE_TOKEN,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+        )
+    except Exception as e:
+        print(f"Warning: Failed to load with auth token, trying without: {e}")
+        # Fall back to loading without auth token for open models
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            padding_side="right"
+        )
+        model = AutoModel.from_pretrained(
+            model_name,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+        )
     
     # Add padding token if needed
     if tokenizer.pad_token is None:
@@ -94,11 +184,21 @@ def analyze_word_combination(words, semantic_set, model_name, trials=100, noise_
     for word in words:
         vector = get_word_vector(word, tokenizer, embedding_layer)
         if vector is None:
-            return
+            print(f"Skipping '{word}' due to tokenization issues.")
+            continue
         word_vectors.append(vector)
     
+    if not word_vectors:
+        print("Error: No valid word vectors found. Cannot proceed.")
+        return
+        
     # Create composite vector
     composite_vector = torch.stack(word_vectors).sum(dim=0)
+    
+    # Check for NaN or Inf values in composite vector
+    if torch.isnan(composite_vector).any() or torch.isinf(composite_vector).any():
+        print("Warning: Composite vector contains NaN or Inf values. Fixing...")
+        composite_vector = torch.nan_to_num(composite_vector, nan=0.0, posinf=1.0, neginf=-1.0)
     
     # Get initial closest words without noise
     print("\nClosest words to the combined vector:")
@@ -229,6 +329,9 @@ if __name__ == "__main__":
 
 ## Basic example with tea and milk
 # python closest_word_analyzer.py --words tea milk
+
+## Complex example for Boba
+# python closest_word_analyzer.py --words tea milk --semantic-words chai coffee latte
 
 ## Complex example with three words
 # python closest_word_analyzer.py --words Asian Spaghetti Soup --semantic-words noodles broth ramen pho
